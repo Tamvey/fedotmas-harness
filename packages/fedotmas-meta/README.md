@@ -32,3 +32,27 @@ when it cannot, so a composed run never fails for want of a cast.
 turns a filling into anything the engine can compile. `SwarmPreset` is the one shipped here,
 the shape `benchmarks/swarm` measures; pass `ranker=by_interest` to give each persona its own
 feed instead of one wall everybody reads.
+
+## The queen inside the loop
+
+`SwarmPreset(casting=True, seats=6)` puts the composer on the board it is composing. It adds
+three things: a `queen` prompt rule that answers with an amendment each round, a `cast` code
+rule that folds amendments into one standing fact, and `seats` free seats. A seat is a persona
+whose character is a fact rather than a string fixed at compile, so it fires only while the
+cast seats someone in it, and reads whoever that is out of the same fact:
+
+```python
+PromptRule(
+    name="seat_0",
+    input="You are: {cast[hired][seat_0]}\n" + FEED,
+    when=lambda v: "seat_0" in v.value("cast")["hired"],
+    ...
+)
+```
+
+That is the whole mechanism, and it needs nothing from the engine: `System.nodes` stays fixed
+at compile, the roster is data on the blackboard like everything else. The cost is that the
+number of seats is fixed up front, and that an amendment reaches the personas two rounds later
+(the queen writes, the fold commits, the seat reads). A seat keeps its first occupant, so a
+queen that forgets which seats it has used cannot rewrite a persona out from under its own
+posts.

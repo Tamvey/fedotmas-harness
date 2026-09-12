@@ -19,6 +19,7 @@ classifiers = [
 dependencies = [
   "fedotmas",
   "fedotmas-llm",
+  "typing-extensions>=4.16.0",
 ]
 
 [tool.uv]

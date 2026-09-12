@@ -69,6 +69,7 @@ swarm meter separately, so the two columns below are two different bills.
 | composed, one call | fell back to hand | 2 | 0.0007 | 76 | 44 408 | 3 406 | 0.0018 | 55s + 51s |
 | composed, batch 10 | 40 composed | 4 | 0.0007 | 76 | 51 979 | 3 666 | 0.0020 | 50s + 48s |
 | composed, batch 10, ranked | 40 composed | 4 | 0.0007 | 76 | 50 130 | 3 564 | 0.0020 | 49s + 52s |
+| composed, batch 10, live queen | 40 + 5 seated | 4 | 0.0006 | 120 | 107 889 | 15 109 | 0.0052 | 43s + 170s |
 
 What the composer runs showed:
 
@@ -92,6 +93,34 @@ What the composer runs showed:
   precondition for a room splitting instead of converging, which one shared wall cannot
   produce; the ranking is word overlap, not embeddings, so it costs nothing and knows nothing.
 
-Every composed run above ended with no failed node, no retry and 3 requests in flight at the
-peak, the same as the handwritten baseline: composing the cast changes who is in the room, not
-how the room runs.
+Every composed run above ended with no retry and 3 requests in flight at the peak, the same as
+the handwritten baseline: composing the cast changes who is in the room, not how the room runs.
+
+## The queen inside the loop
+
+`--seats 6` keeps the composer on the board for the whole run: it reads the feed its own
+personas wrote and each round may seat a new voice in a free seat, send one home, or do
+nothing. The mechanism is described in `packages/fedotmas-meta/README.md`; what it did here:
+
+- **It used the room.** Nine of its fourteen answers carried a change. It filled five of the
+  six seats, sent one persona home, and left the room alone the other five rounds, which was
+  the instruction.
+- **It forgot which seats it had used, four times out of nine.** Twice it tried to seat a new
+  character in `seat_0` after filling it, twice in `seat_3`. The fold keeps a seat's first
+  occupant, so those were inert rather than rewriting a persona out from under posts it had
+  already made. Without that rule the run would have silently swapped characters mid-stream.
+- **A late arrival is nearly inaudible.** Five seated voices produced two posts between them.
+  `ActivitySample` gives a newcomer the same odds as anyone else, so a voice seated at round 7
+  competes with forty others for three to eight slots over the eight rounds it has left. If
+  the queen's interventions are meant to change the conversation, a newcomer needs a louder
+  `activity_level` than the room, or the room needs to be smaller.
+- **It is not free.** Against the same run without it: input roughly doubled, output more than
+  quadrupled, wall time tripled and the bill went from $0.0020 to $0.0052, for two extra posts.
+  The queen fires every round, is exempt from the activity throttle as infrastructure, and its
+  structured answer is the most expensive single call in the run.
+- **One of its calls failed output validation** (`UnexpectedModelBehavior`, retries exhausted)
+  and became an `error:queen` fact. The board is lenient, so the swarm carried on and the cast
+  simply did not change that round. Nothing else in the run failed.
+
+The mechanism works and costs nothing in the engine. Whether it earns its tokens at this shape
+is a different question, and at forty personas the honest answer is no.

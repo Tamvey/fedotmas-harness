@@ -10,6 +10,9 @@ from fedotmas.engine import ActivitySample, View
 from fedotmas.engine.contract import Fact
 from fedotmas_llm import PromptRule
 
+# pydantic refuses typing.TypedDict as a schema source below 3.12
+from typing_extensions import TypedDict
+
 from fedotmas_meta._assemble import Agent, Fill
 from fedotmas_meta._spec import RoleSpec, SpecError
 
@@ -19,7 +22,43 @@ CONDUCT = (
     "quotes, no hashtags."
 )
 FEED = "Topic: {topic}\nRound: {input}\nFeed so far:\n{feed}"
+SEAT = "You are: {cast[hired][NAME]}\n" + FEED
 EMPTY = "(nothing yet)"
+
+QUEEN = """You run the casting for a public feed arguing one topic. Each round you may seat a
+new voice in a free seat, or send one home, or do nothing.
+
+Answer with {{"hire": {{"<a free seat>": "<the character>"}}, "retire": ["<a name>"]}}. The
+value under a seat is the character itself, written in the second person the way the others
+were written, one or two sentences: "You are a ... who ...". It is never a name.
+
+Seat a voice when the feed keeps circling and nobody present can break it. Send one home when
+it has stopped saying anything the others do not already say. Most rounds the right answer is
+neither, and {{"hire": {{}}, "retire": []}} is a real answer.
+
+The voices already in the room are: {room}.
+The free seats are: {seats}. Never seat anyone anywhere else, and only ever send home a name
+from one of those two lists."""
+
+CASTING = "Round: {input}\nChanges so far: {cast}\nFeed so far:\n{feed}"
+
+
+class Amendment(TypedDict):
+    """What the queen may change this round: characters to seat, keyed by a free seat, and
+    names to send home. Both empty is the usual answer. A TypedDict and not a model because a
+    fact has to survive SqliteStore, which keeps values as json."""
+
+    hire: dict[str, str]
+    retire: list[str]
+
+
+class Cast(TypedDict):
+    """Who is in the room, folded from the queen's amendments: the occupied seats and everyone
+    sent home. A seat reads its own character out of `hired`, a persona checks `retired`."""
+
+    hired: dict[str, str]
+    retired: list[str]
+
 
 Ranker = Callable[[Agent, list[Fact]], list[Fact]]
 
@@ -55,7 +94,6 @@ class SwarmPreset:
             "personas", "one per voice you want in the room, keyed by a short id", True
         ),
     )
-    reserved = frozenset({"clock", "feed"})
 
     def __init__(
         self,
@@ -65,6 +103,8 @@ class SwarmPreset:
         max_active: int | None = 8,
         activity: tuple[float, float] = (0.2, 1.0),
         ranker: Ranker | None = None,
+        casting: bool = False,
+        seats: int = 4,
         rng: random.Random | None = None,
     ) -> None:
         self.feed_width = feed_width
@@ -72,26 +112,114 @@ class SwarmPreset:
         self.max_active = max_active
         self.activity = activity
         self.ranker = ranker
+        self.casting = casting
+        self.seats = seats if casting else 0
         self._rng = rng or random.Random()
+
+    @property
+    def reserved(self) -> frozenset[str]:
+        """Grows with casting: the queen, the fold and every free seat are nodes too, so a
+        composed persona must not be named after one."""
+        names = {"clock", "feed"}
+        if self.casting:
+            names |= {"queen", "cast", *self._seats()}
+        return frozenset(names)
+
+    def _seats(self) -> list[str]:
+        return [f"seat_{i}" for i in range(self.seats)]
 
     def seed(self, topic: str, personas: Iterable[str] = ()) -> dict[str, Any]:
         """The opening facts. With a ranker every persona reads its own feed tag, and a tag
         nothing has written yet is a missing template reference, so the cast has to be named
         here for the first round to run at all."""
-        feeds = ["feed"] if self.ranker is None else [f"feed_{n}" for n in personas]
-        return {"tick": 0, "topic": topic} | {tag: EMPTY for tag in feeds}
+        feeds = [f"feed_{n}" for n in personas] if self.ranker is not None else []
+        if self.ranker is None or self.casting:
+            feeds.append("feed")
+        opening: dict[str, Any] = {"tick": 0, "topic": topic}
+        if self.casting:
+            opening["cast"] = Cast(hired={}, retired=[])
+        return opening | {tag: EMPTY for tag in feeds}
 
     def build(self, fill: Fill) -> Board:
         personas = fill["personas"]
         assert isinstance(personas, dict)
         agents = list(personas.values())
-        feeds = [self._feed()] if self.ranker is None else self._ranked(agents)
+        feeds = self._ranked(agents) if self.ranker is not None else []
+        # a seat reads the common wall even when the personas read their own rankings: what
+        # it is interested in is not known until the cast seats someone in it
+        if self.ranker is None or self.casting:
+            feeds.append(self._feed())
+        casting = (
+            [
+                self._queen([a.name for a in agents]),
+                self._fold(),
+                *(self._seat(s) for s in self._seats()),
+            ]
+            if self.casting
+            else []
+        )
         return blackboard(
             self._clock(),
             *feeds,
+            *casting,
             *(self._persona(a) for a in agents),
             policy=ActivitySample(self.min_active, self.max_active, rng=self._rng),
             halt_on_error=False,
+        )
+
+    def _queen(self, room: list[str]) -> PromptRule:
+        """The casting agent, a rule on the board it is casting: it reads the feed its own
+        personas wrote and answers with an amendment. Nothing about it is privileged, it just
+        writes a fact the others happen to read."""
+        return PromptRule(
+            name="queen",
+            prompt=QUEEN.format(room=room, seats=self._seats()),
+            input=CASTING,
+            returns=Amendment,
+            reads="tick",
+            writes="amendment",
+            when=lambda v: True,
+        )
+
+    def _fold(self) -> Rule:
+        """Folds amendments into the standing cast. Code and not a prompt on purpose: asking a
+        model to restate the whole room every round is how a room loses members. An occupied
+        seat keeps its occupant, so a queen that forgets which seats it has used cannot rewrite
+        a persona out from under the posts it has already made."""
+
+        async def fold(amendment: Amendment, view: View) -> Cast:
+            cast = _cast_of(view)
+            retired = list(
+                dict.fromkeys([*cast["retired"], *amendment.get("retire", ())])
+            )
+            hired = dict(cast["hired"])
+            for seat, character in amendment.get("hire", {}).items():
+                hired.setdefault(seat, character)
+            return Cast(
+                hired={k: v for k, v in hired.items() if k not in retired},
+                retired=retired,
+            )
+
+        return Rule(
+            name="cast",
+            fn=fold,
+            reads="amendment",
+            writes="cast",
+            when=lambda v: v.exists("amendment"),
+        )
+
+    def _seat(self, name: str) -> PromptRule:
+        """A free seat: a persona whose character is a fact instead of a string fixed at
+        compile, so it exists only while the cast seats someone in it and is whoever that is.
+        This is the whole trick of a live roster, and it needs nothing from the engine."""
+        return PromptRule(
+            name=name,
+            prompt=CONDUCT,
+            input=SEAT.replace("NAME", name),
+            reads="tick",
+            writes="post",
+            when=lambda v, n=name: n in _cast_of(v)["hired"],
+            meta={"activity_level": self._rng.uniform(*self.activity)},
         )
 
     def _clock(self) -> Rule:
@@ -134,13 +262,16 @@ class SwarmPreset:
         template = FEED
         if self.ranker is not None:
             template = FEED.replace("{feed}", f"{{{_feed_tag(agent)}}}")
+        alive: Callable[[View], bool] = lambda v: True
+        if self.casting:
+            alive = lambda v, n=agent.name: n not in _cast_of(v)["retired"]
         return PromptRule(
             name=agent.name,
             prompt=f"{agent.prompt}\n{CONDUCT}",
             input=template,
             reads="tick",
             writes="post",
-            when=lambda v: True,
+            when=alive,
             llm=agent.llm,
             tools=list(agent.tools) or None,
             meta={"activity_level": self._rng.uniform(*self.activity)},
@@ -149,3 +280,10 @@ class SwarmPreset:
 
 def _feed_tag(agent: Agent | None) -> str:
     return "feed" if agent is None else f"feed_{agent.name}"
+
+
+def _cast_of(view: View) -> Cast:
+    cast = view.value("cast")
+    if not isinstance(cast, dict):
+        return Cast(hired={}, retired=[])
+    return Cast(hired=cast.get("hired", {}), retired=cast.get("retired", []))

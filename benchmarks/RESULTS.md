@@ -150,10 +150,14 @@ Whether a meta-agent can write the cast the swarm above runs by hand. Commentary
 | composed, one call | fell back to hand | 2 | 0.0007 | 76 | 44 408 | 3 406 | 0.0018 | 55s + 51s |
 | composed, batch 10 | 40 composed | 4 | 0.0007 | 76 | 51 979 | 3 666 | 0.0020 | 50s + 48s |
 | composed, batch 10, ranked | 40 composed | 4 | 0.0007 | 76 | 50 130 | 3 564 | 0.0020 | 49s + 52s |
+| composed, batch 10, live queen | 40 + 5 seated | 4 | 0.0006 | 120 | 107 889 | 15 109 | 0.0052 | 43s + 170s |
 
 _`openrouter:qwen/qwen3.7-flash`, 2026-09-12, reasoning off, seed 7, same `ActivitySample(3, 8)`
 + `ConcurrencyLimit(3)` + `Retry(3, on=ModelHTTPError)` over `SqliteStore` as the run above.
 Priced at the catalog's $0.03/M input, $0.13/M output. Asked for all 40 personas in one answer
 the model returned 31 and then 38 and the run fell back to the handwritten cast; asked for 10
 at a time it filled all 40 with nothing rejected. Composing costs four calls against the run's
-76 and does not grow with the number of rounds._
+76 and does not grow with the number of rounds. The last row keeps the composer on the board
+(`--seats 6`): it changed the cast in 9 of its 14 answers and filled 5 seats, but a voice
+seated mid-run competes with 40 others for 3 to 8 slots a round and the five of them managed
+two posts between them, at 2.6x the cost of the same run without it._

@@ -100,6 +100,19 @@ def _usage(llm: PydanticAI) -> dict[str, int]:
     }
 
 
+def _casting(view) -> dict[str, Any]:
+    """What the live queen actually did: an amendment per round, the seats it filled and the
+    personas it sent home."""
+    final = view.value("cast") or {}
+    moves = [a.value for a in view.query("amendment")]
+    return {
+        "amendments": sum(1 for a in moves if a.get("hire") or a.get("retire")),
+        "rounds": len(moves),
+        "hired": final.get("hired", {}),
+        "retired": final.get("retired", []),
+    }
+
+
 def _cost(usage: dict[str, int], args: argparse.Namespace) -> float:
     prompt = usage["input_tokens"] * args.price_in
     return (prompt + usage["output_tokens"] * args.price_out) / 1e6
@@ -116,6 +129,8 @@ async def main(args: argparse.Namespace) -> dict[str, Any]:
         min_active=args.min_active,
         max_active=args.max_active,
         ranker=by_interest if args.ranked else None,
+        casting=args.seats > 0,
+        seats=args.seats,
         rng=rng,
     )
 
@@ -161,12 +176,16 @@ async def main(args: argparse.Namespace) -> dict[str, Any]:
     )
     elapsed = time.monotonic() - started
 
-    posts = store.snapshot().query("post")
+    # a SqliteStore snapshot reads through the live connection, so everything the report
+    # needs comes off the store before it is closed
+    store_view = store.snapshot()
+    posts = store_view.query("post")
+    casting = _casting(store_view) if args.seats else {}
     store.close()
 
     # by cast, not by exclusion: with --ranked the preset also wires a feed rule per persona,
     # and those are named after the personas rather than reserved
-    voices = set(cast)
+    voices = set(cast) | {f"seat_{i}" for i in range(args.seats)}
 
     def spoke(step) -> int:
         return sum(1 for name in step.fired if name in voices)
@@ -190,6 +209,7 @@ async def main(args: argparse.Namespace) -> dict[str, Any]:
         "seconds": round(elapsed, 1),
         "usd": round(_cost(swarm_usage, args), 6),
         "cast": cast,
+        "casting": casting,
         "sample": [f"{f.producer}: {f.value}" for f in posts[:3]],
     }
     if composed is not None:
@@ -228,6 +248,9 @@ def cli() -> argparse.Namespace:
     p.add_argument("--repairs", type=int, default=1, help="retries on a rejected spec")
     p.add_argument(
         "--ranked", action="store_true", help="give each persona its own ranked feed"
+    )
+    p.add_argument(
+        "--seats", type=int, default=0, help="free seats a queen may fill mid-run"
     )
     p.add_argument("--seed", type=int, default=7)
     p.add_argument("--topic", default=TOPIC)
