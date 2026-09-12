@@ -1,22 +1,27 @@
 # Swarm
 
-What a swarm of prompt rules costs on a real provider. The system is the one in
+What a swarm of prompt rules costs on a real provider, and what it costs to have a meta-agent
+write the swarm instead of writing it by hand. The system is the one in
 `packages/fedotmas-llm/tests/test_swarm.py` with the stub LLM swapped for `PydanticAI`:
-N personas with per-agent `activity_level` argue a topic on a shared feed, `ActivitySample`
+personas with per-agent `activity_level` argue a topic on a shared feed, `ActivitySample`
 picks who speaks each round, `ConcurrencyLimit` caps in-flight requests, `Retry` covers
 provider HTTP failures, and `SqliteStore` holds the feed in a file. The stub test stays the
 deterministic unit test; this is the paid, non-deterministic half, so it lives outside pytest.
 
+The board itself is `fedotmas_meta.presets.SwarmPreset`, so the same shape is what
+`fedotmas_meta.compose` fills when `--compose` is passed.
+
 ```bash
 uv sync --all-packages --extra pydantic-ai
 echo 'OPENROUTER_API_KEY=...' >> .env
-uv run --group examples python benchmarks/swarm/run.py --personas 40 --rounds 15
+uv run python benchmarks/swarm/run.py --personas 40 --rounds 15
+uv run python benchmarks/swarm/run.py --personas 40 --rounds 15 --compose --batch 10
 ```
 
 A run writes its report to `benchmarks/out/<db>.json` and leaves the feed itself in the
 SQLite file beside it, readable mid-run from another process.
 
-## Results
+## Swarm cost
 
 `qwen/qwen3.8-flash` via OpenRouter, 2026-09-12. 40 personas, 15 rounds,
 `ActivitySample(3, 8)`, `ConcurrencyLimit(3)`, `Retry(3, on=ModelHTTPError)`,
@@ -51,3 +56,42 @@ Three things the numbers say:
 
 The feed a persona reads trails the store by one round: a superstep commits at its end, so
 the digest written in round n is read in round n+1 and covers posts through round n-1.
+
+## Composing the cast
+
+`qwen/qwen3.7-flash` via OpenRouter, 2026-09-12, same 40 x 15 shape and same throttle, all
+runs with reasoning off, priced at $0.03/M input and $0.13/M output. The composer and the
+swarm meter separately, so the two columns below are two different bills.
+
+| run | cast | compose calls | compose USD | requests | input | output | swarm USD | wall |
+|---|---|---|---|---|---|---|---|---|
+| handwritten | 40 by hand | | | 76 | 44 629 | 3 348 | 0.0018 | 49s |
+| composed, one call | fell back to hand | 2 | 0.0007 | 76 | 44 408 | 3 406 | 0.0018 | 55s + 51s |
+| composed, batch 10 | 40 composed | 4 | 0.0007 | 76 | 51 979 | 3 666 | 0.0020 | 50s + 48s |
+| composed, batch 10, ranked | 40 composed | 4 | 0.0007 | 76 | 50 130 | 3 564 | 0.0020 | 49s + 52s |
+
+What the composer runs showed:
+
+- **One call cannot fill a large cast.** Asked for 40 personas in one answer the model
+  returned 31 and then 38, twice in a row, and the run fell back to the handwritten voices.
+  Asked for 20 it succeeded on the second try; for 10, on the first. In batches of 10, told
+  which ids are already in the room, it filled all 40 with no rejected batch at all, twice.
+  The failure is head count, not schema or truncation: the structured output validated every
+  time, and the answers were well inside `max_tokens`.
+- **Composition is cheap and does not scale with the run.** Four calls configure a run that
+  then costs 76; the composer is about a third of the bill once and nothing per round.
+- **The fallback is what makes it safe.** The run whose composition failed still produced a
+  full 15-round conversation at exactly the handwritten cost, because `compose(fallback=...)`
+  hands back the handwritten spec instead of raising.
+- **Batching fixes head count, not variety.** 26 of the 40 composed ids share a word stem with
+  another (`biosecurity_guardian` and `biosecurity_sentinel`, `adversarial_ml_researcher` and
+  `adversarial_tester`). Naming the taken ids stops duplicate keys, not duplicate viewpoints.
+- **Personal feeds are free.** `--ranked` gives every persona its own feed rule, ranking the
+  same posts by how much of their vocabulary that persona already uses. That is 40 extra rules
+  firing every round, all of them plain Python, and the provider bill does not move. It is the
+  precondition for a room splitting instead of converging, which one shared wall cannot
+  produce; the ranking is word overlap, not embeddings, so it costs nothing and knows nothing.
+
+Every composed run above ended with no failed node, no retry and 3 requests in flight at the
+peak, the same as the handwritten baseline: composing the cast changes who is in the room, not
+how the room runs.

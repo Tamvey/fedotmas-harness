@@ -138,3 +138,22 @@ _`openrouter:qwen/qwen3.8-flash`, 2026-09-12, seed 7, `ActivitySample(3, 8)` +
 `ConcurrencyLimit(3)` + `Retry(3, on=ModelHTTPError)` over `SqliteStore`. Priced at the
 catalog's $0.15/M input, $0.47/M output. ActivitySample turned 600 possible persona-rounds
 into 76 requests; no 429 or 5xx occurred, so Retry never fired._
+
+## Composing the swarm — qwen3.7-flash (40 agents, 15 rounds)
+
+Whether a meta-agent can write the cast the swarm above runs by hand. Commentary in
+`benchmarks/swarm/README.md`; run with `benchmarks/swarm/run.py --compose --batch 10`.
+
+| run | cast | compose calls | compose USD | requests | input | output | swarm USD | wall |
+|---|---|---|---|---|---|---|---|---|
+| handwritten | 40 by hand | | | 76 | 44 629 | 3 348 | 0.0018 | 49s |
+| composed, one call | fell back to hand | 2 | 0.0007 | 76 | 44 408 | 3 406 | 0.0018 | 55s + 51s |
+| composed, batch 10 | 40 composed | 4 | 0.0007 | 76 | 51 979 | 3 666 | 0.0020 | 50s + 48s |
+| composed, batch 10, ranked | 40 composed | 4 | 0.0007 | 76 | 50 130 | 3 564 | 0.0020 | 49s + 52s |
+
+_`openrouter:qwen/qwen3.7-flash`, 2026-09-12, reasoning off, seed 7, same `ActivitySample(3, 8)`
++ `ConcurrencyLimit(3)` + `Retry(3, on=ModelHTTPError)` over `SqliteStore` as the run above.
+Priced at the catalog's $0.03/M input, $0.13/M output. Asked for all 40 personas in one answer
+the model returned 31 and then 38 and the run fell back to the handwritten cast; asked for 10
+at a time it filled all 40 with nothing rejected. Composing costs four calls against the run's
+76 and does not grow with the number of rounds._

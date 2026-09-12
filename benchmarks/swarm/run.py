@@ -1,12 +1,14 @@
 """The swarm of `packages/fedotmas-llm/tests/test_swarm.py` on a real provider instead of a
-stub: N personas argue a topic on a shared feed for R rounds, with ActivitySample deciding who
-speaks each round, ConcurrencyLimit capping in-flight requests and SqliteStore holding the feed,
-and the provider's token usage reported for the whole run.
+stub: personas argue a topic on a shared feed, ActivitySample decides who speaks each round,
+ConcurrencyLimit caps in-flight requests, SqliteStore holds the feed, and the provider's token
+usage is reported for the whole run. With --compose the cast is written by a meta-agent instead
+of by hand, metered separately so composition and simulation costs stay apart.
 
 Costs money and needs OPENROUTER_API_KEY in .env, so it lives here and not under pytest.
 
 Usage:
-uv run --group examples python benchmarks/swarm/run.py --personas 2 --rounds 1 --concurrency 1
+uv run python benchmarks/swarm/run.py --personas 2 --rounds 1 --concurrency 1
+uv run python benchmarks/swarm/run.py --personas 10 --rounds 3 --compose
 """
 
 from __future__ import annotations
@@ -21,12 +23,13 @@ from pathlib import Path
 from typing import Any
 
 from dotenv import load_dotenv
-from fedotmas import Plugin, Rule, blackboard
-from fedotmas.engine import ActivitySample, PluginDispatcher, SqliteStore, View
+from fedotmas import Plugin
+from fedotmas.engine import PluginDispatcher, SqliteStore, View
 from fedotmas.engine.contract import Fact, Node, Result
 from fedotmas.ext.plugins import ConcurrencyLimit, Retry
-from fedotmas_llm import PromptRule
 from fedotmas_llm.adapters.pydantic_ai import PydanticAI
+from fedotmas_meta import AgentSpec, Catalog, SystemSpec, assemble, compose
+from fedotmas_meta.presets import SwarmPreset, by_interest
 from pydantic_ai.exceptions import ModelHTTPError
 
 TOPIC = "Should frontier AI labs release model weights openly?"
@@ -73,50 +76,33 @@ class Watch(Plugin):
         self.errors[node.describe().name] += 1
 
 
-def _clock() -> Rule:
-    async def tick(v: int) -> int:
-        return v + 1
-
-    return Rule(name="clock", fn=tick, reads="tick", writes="tick", when=lambda v: True)
-
-
-def _feed() -> Rule:
-    """Infrastructure (no activity_level, so ActivitySample always fires it): fold the posts
-    so far into the blurb the personas read next round. Writes commit at the end of a
-    superstep, so the feed a persona sees trails the live store by one round."""
-
-    async def digest(_: int, view: View) -> str:
-        posts = view.query("post")[-FEED_WIDTH:]
-        return "\n".join(f"{f.producer}: {f.value}" for f in posts) or "(nothing yet)"
-
-    return Rule(
-        name="feed", fn=digest, reads="tick", writes="feed", when=lambda v: True
-    )
-
-
-def _personas(n: int, rng: random.Random) -> list[PromptRule]:
-    """One rule per persona, each with its own activity_level: the fedotmas analogue of the
-    per-agent activity profile an OASIS-style simulation samples its speakers from."""
-    rules = []
+def handwritten(n: int) -> SystemSpec:
+    """The hand-built cast, both the default and what the queen falls back to. Character only:
+    how to behave on the feed is the preset's to say."""
+    fill = {}
     for i in range(n):
         role, quirk = VOICES[i % len(VOICES)]
-        rules.append(
-            PromptRule(
-                name=f"persona_{i}",
-                prompt=(
-                    f"You are persona {i}, {role} who {quirk}. You post on a public feed. "
-                    "Write ONE post of at most two sentences, in character, answering the "
-                    "topic and reacting to the feed if it is not empty. No preamble, no "
-                    "quotes, no hashtags."
-                ),
-                input="Topic: {topic}\nRound: {input}\nFeed so far:\n{feed}",
-                reads="tick",
-                writes="post",
-                when=lambda v: True,
-                meta={"activity_level": rng.uniform(0.2, 1.0)},
-            )
+        fill[f"persona_{i}"] = AgentSpec(
+            prompt=f"You are persona {i}, {role} who {quirk}."
         )
-    return rules
+    return SystemSpec(preset="swarm", fill={"personas": fill})
+
+
+def _usage(llm: PydanticAI) -> dict[str, int]:
+    u = llm.usage
+    return {
+        "requests": u.requests,
+        "input_tokens": u.input_tokens,
+        "output_tokens": u.output_tokens,
+        # reasoning is billed inside output_tokens and fedotmas_llm.Usage does not model the
+        # split, so read the provider's own breakdown off the adapter's RunUsage
+        "reasoning_tokens": llm._usage.details.get("reasoning_tokens", 0),
+    }
+
+
+def _cost(usage: dict[str, int], args: argparse.Namespace) -> float:
+    prompt = usage["input_tokens"] * args.price_in
+    return (prompt + usage["output_tokens"] * args.price_out) / 1e6
 
 
 async def main(args: argparse.Namespace) -> dict[str, Any]:
@@ -125,29 +111,49 @@ async def main(args: argparse.Namespace) -> dict[str, Any]:
     if args.no_reasoning:
         settings["extra_body"] = {"reasoning": {"enabled": False}}
     backend = PydanticAI(model=args.model, model_settings=settings)
+    preset = SwarmPreset(
+        feed_width=FEED_WIDTH,
+        min_active=args.min_active,
+        max_active=args.max_active,
+        ranker=by_interest if args.ranked else None,
+        rng=rng,
+    )
+
+    fallback = handwritten(args.personas)
+    queen = PydanticAI(model=args.model, model_settings=settings | {"max_tokens": 8000})
+    composed = None
+    started = time.monotonic()
+    if args.compose:
+        composed = await compose(
+            args.topic,
+            preset,
+            llm=queen,
+            count=args.personas,
+            batch=args.batch or None,
+            repairs=args.repairs,
+            fallback=fallback,
+        )
+    composing = time.monotonic() - started
+
+    spec = composed.spec if composed else fallback
+    cast = sorted(spec.fill["personas"])
+    board = assemble(spec, Catalog(preset))
     watch = Watch()
     plugins = PluginDispatcher(
-        # only HTTP failures are worth another attempt: a 429 or a 5xx clears, a bad
-        # prompt or a blown token budget just repeats
+        # only HTTP failures are worth another attempt: a 429 or a 5xx clears, a bad prompt
+        # or a blown token budget just repeats
         [
             Retry(args.retries, on=ModelHTTPError),
             ConcurrencyLimit(args.concurrency),
             watch,
         ]
     )
-    board = blackboard(
-        _clock(),
-        _feed(),
-        *_personas(args.personas, rng),
-        policy=ActivitySample(args.min_active, args.max_active, rng=rng),
-        halt_on_error=False,
-    )
     system = board.system(bind={"llm": backend}, plugins=plugins)
     store = SqliteStore(args.db)
 
     started = time.monotonic()
     run = await system.run(
-        {"tick": 0, "topic": args.topic, "feed": "(nothing yet)"},
+        preset.seed(args.topic, cast),
         goal="__never__",  # nothing writes this tag: only the round budget ends the run
         budget=args.rounds,
         plugins=plugins,
@@ -158,42 +164,50 @@ async def main(args: argparse.Namespace) -> dict[str, Any]:
     posts = store.snapshot().query("post")
     store.close()
 
-    usage = backend.usage
-    fired = sum(1 for s in run.steps for name in s.fired if name.startswith("persona_"))
+    # by cast, not by exclusion: with --ranked the preset also wires a feed rule per persona,
+    # and those are named after the personas rather than reserved
+    voices = set(cast)
+
+    def spoke(step) -> int:
+        return sum(1 for name in step.fired if name in voices)
+
+    swarm_usage = _usage(backend)
     invocations = sum(len(s.fired) for s in run.steps)
-    cost = (
-        usage.input_tokens * args.price_in + usage.output_tokens * args.price_out
-    ) / 1e6
-    return {
+    report = {
         "model": args.model,
         "personas": args.personas,
         "rounds": len(run.steps),
         "reason": run.reason,
-        "active_per_round": [
-            sum(1 for name in s.fired if name.startswith("persona_")) for s in run.steps
-        ],
-        "personas_fired": fired,
+        "active_per_round": [spoke(s) for s in run.steps],
+        "personas_fired": sum(spoke(s) for s in run.steps),
         "posts": len(posts),
-        "requests": usage.requests,
-        "input_tokens": usage.input_tokens,
-        "output_tokens": usage.output_tokens,
-        # reasoning is billed inside output_tokens; fedotmas_llm.Usage does not model the
-        # split, so read the provider's own breakdown off the adapter's RunUsage
-        "reasoning_tokens": backend._usage.details.get("reasoning_tokens", 0),
+        **swarm_usage,
         "attempts": watch.attempts,
         "retried": watch.attempts - invocations,
         "raised": dict(watch.failures),
         "failed_nodes": dict(watch.errors),
         "peak_in_flight": watch.peak,
         "seconds": round(elapsed, 1),
-        "usd": round(cost, 6),
+        "usd": round(_cost(swarm_usage, args), 6),
+        "cast": cast,
         "sample": [f"{f.producer}: {f.value}" for f in posts[:3]],
     }
+    if composed is not None:
+        queen_usage = _usage(queen)
+        report["composed"] = {
+            "attempts": composed.attempts,
+            "fell_back": composed.fell_back,
+            "rejected": list(composed.rejected),
+            "seconds": round(composing, 1),
+            "usd": round(_cost(queen_usage, args), 6),
+            **queen_usage,
+        }
+    return report
 
 
 def cli() -> argparse.Namespace:
     p = argparse.ArgumentParser()
-    p.add_argument("--model", default="openrouter:qwen/qwen3.8-flash")
+    p.add_argument("--model", default="openrouter:qwen/qwen3.7-flash")
     p.add_argument("--personas", type=int, default=10)
     p.add_argument("--rounds", type=int, default=3)
     p.add_argument("--min-active", type=int, default=2)
@@ -202,6 +216,19 @@ def cli() -> argparse.Namespace:
     p.add_argument("--retries", type=int, default=3)
     p.add_argument("--max-tokens", type=int, default=800)
     p.add_argument("--no-reasoning", action="store_true")
+    p.add_argument(
+        "--compose", action="store_true", help="let a meta-agent write the personas"
+    )
+    p.add_argument(
+        "--batch",
+        type=int,
+        default=10,
+        help="personas per composing call (0 for one call)",
+    )
+    p.add_argument("--repairs", type=int, default=1, help="retries on a rejected spec")
+    p.add_argument(
+        "--ranked", action="store_true", help="give each persona its own ranked feed"
+    )
     p.add_argument("--seed", type=int, default=7)
     p.add_argument("--topic", default=TOPIC)
     p.add_argument("--db", default=str(Path(__file__).parents[1] / "out" / "swarm.db"))
@@ -209,9 +236,9 @@ def cli() -> argparse.Namespace:
         "--report", default="", help="where to write the report (default: <db>.json)"
     )
     p.add_argument(
-        "--price-in", type=float, default=0.15, help="USD per 1M input tokens"
+        "--price-in", type=float, default=0.03, help="USD per 1M input tokens"
     )
-    p.add_argument("--price-out", type=float, default=0.47, help="USD per 1M output")
+    p.add_argument("--price-out", type=float, default=0.13, help="USD per 1M output")
     return p.parse_args()
 
 
