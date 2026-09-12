@@ -161,3 +161,19 @@ at a time it filled all 40 with nothing rejected. Composing costs four calls aga
 (`--seats 6`): it changed the cast in 9 of its 14 answers and filled 5 seats, but a voice
 seated mid-run competes with 40 others for 3 to 8 slots a round and the five of them managed
 two posts between them, at 2.6x the cost of the same run without it._
+
+## Stopping on budget — qwen3.7-flash (10 agents, 8 rounds)
+
+Whether a run can be told what it may spend instead of how many rounds it may take. Commentary
+in `benchmarks/swarm/README.md`; run with `benchmarks/swarm/run.py --usd 0.001`.
+
+| cap | requests | input | output | USD | rounds | skipped | reason |
+|---|---|---|---|---|---|---|---|
+| `--requests 8` | 9 | 1 184 | 346 | 0.000081 | 7 of 8 | 12 | stalled |
+| `--usd 0.00005` | 8 | 992 | 326 | 0.000072 | 7 of 8 | 13 | stalled |
+
+_`openrouter:qwen/qwen3.7-flash`, 2026-09-12, reasoning off, seed 7, concurrency 2, priced at
+$0.03/M input and $0.13/M output. `SpendLimit` sits under `ConcurrencyLimit` and checks the cap
+before each call, so calls already in flight still land and the overshoot is bounded by the
+concurrency (1 request here). Past the cap no node is called at all, so nothing is written,
+nothing re-arms and the run ends itself with the feed intact._

@@ -2,13 +2,15 @@
 stub: personas argue a topic on a shared feed, ActivitySample decides who speaks each round,
 ConcurrencyLimit caps in-flight requests, SqliteStore holds the feed, and the provider's token
 usage is reported for the whole run. With --compose the cast is written by a meta-agent instead
-of by hand, metered separately so composition and simulation costs stay apart.
+of by hand, metered separately so composition and simulation costs stay apart. With --usd (or
+--tokens, --requests) the run also stops when its budget is spent, mid-conversation.
 
 Costs money and needs OPENROUTER_API_KEY in .env, so it lives here and not under pytest.
 
 Usage:
 uv run python benchmarks/swarm/run.py --personas 2 --rounds 1 --concurrency 1
 uv run python benchmarks/swarm/run.py --personas 10 --rounds 3 --compose
+uv run python benchmarks/swarm/run.py --personas 40 --rounds 15 --usd 0.001
 """
 
 from __future__ import annotations
@@ -27,6 +29,7 @@ from fedotmas import Plugin
 from fedotmas.engine import PluginDispatcher, SqliteStore, View
 from fedotmas.engine.contract import Fact, Node, Result
 from fedotmas.ext.plugins import ConcurrencyLimit, Retry
+from fedotmas_llm import Price, SpendLimit
 from fedotmas_llm.adapters.pydantic_ai import PydanticAI
 from fedotmas_meta import AgentSpec, Catalog, SystemSpec, assemble, compose
 from fedotmas_meta.presets import SwarmPreset, by_interest
@@ -88,6 +91,20 @@ def handwritten(n: int) -> SystemSpec:
     return SystemSpec(preset="swarm", fill={"personas": fill})
 
 
+def _capped(backend: PydanticAI, args: argparse.Namespace) -> SpendLimit | None:
+    """The run's budget, built after composing so the cast costs whatever it costs and the
+    cap covers the conversation itself."""
+    if not (args.usd or args.tokens or args.requests):
+        return None
+    return SpendLimit(
+        backend,
+        usd=args.usd or None,
+        tokens=args.tokens or None,
+        requests=args.requests or None,
+        price=Price(args.price_in, args.price_out),
+    )
+
+
 def _usage(llm: PydanticAI) -> dict[str, int]:
     u = llm.usage
     return {
@@ -111,11 +128,6 @@ def _casting(view) -> dict[str, Any]:
         "hired": final.get("hired", {}),
         "retired": final.get("retired", []),
     }
-
-
-def _cost(usage: dict[str, int], args: argparse.Namespace) -> float:
-    prompt = usage["input_tokens"] * args.price_in
-    return (prompt + usage["output_tokens"] * args.price_out) / 1e6
 
 
 async def main(args: argparse.Namespace) -> dict[str, Any]:
@@ -154,12 +166,16 @@ async def main(args: argparse.Namespace) -> dict[str, Any]:
     cast = sorted(spec.fill["personas"])
     board = assemble(spec, Catalog(preset))
     watch = Watch()
+    limit = _capped(backend, args)
     plugins = PluginDispatcher(
         # only HTTP failures are worth another attempt: a 429 or a 5xx clears, a bad prompt
-        # or a blown token budget just repeats
+        # or a blown token budget just repeats. SpendLimit sits under ConcurrencyLimit so it
+        # checks the cap where the call actually leaves, and over Watch so a skipped node is
+        # not counted as an attempt
         [
             Retry(args.retries, on=ModelHTTPError),
             ConcurrencyLimit(args.concurrency),
+            *([limit] if limit else []),
             watch,
         ]
     )
@@ -169,7 +185,7 @@ async def main(args: argparse.Namespace) -> dict[str, Any]:
     started = time.monotonic()
     run = await system.run(
         preset.seed(args.topic, cast),
-        goal="__never__",  # nothing writes this tag: only the round budget ends the run
+        goal="__never__",  # nothing writes this tag: only rounds or the budget end the run
         budget=args.rounds,
         plugins=plugins,
         store=store,
@@ -191,7 +207,11 @@ async def main(args: argparse.Namespace) -> dict[str, Any]:
         return sum(1 for name in step.fired if name in voices)
 
     swarm_usage = _usage(backend)
-    invocations = sum(len(s.fired) for s in run.steps)
+    price = Price(args.price_in, args.price_out)
+    # a node the budget skipped is armed and reported as fired but never reaches Watch, so
+    # it is not an invocation for the retry arithmetic
+    skipped = limit.skipped if limit else 0
+    invocations = sum(len(s.fired) for s in run.steps) - skipped
     report = {
         "model": args.model,
         "personas": args.personas,
@@ -207,7 +227,8 @@ async def main(args: argparse.Namespace) -> dict[str, Any]:
         "failed_nodes": dict(watch.errors),
         "peak_in_flight": watch.peak,
         "seconds": round(elapsed, 1),
-        "usd": round(_cost(swarm_usage, args), 6),
+        "usd": round(price.of(backend.usage), 6),
+        "budget": limit.report() if limit else {},
         "cast": cast,
         "casting": casting,
         "sample": [f"{f.producer}: {f.value}" for f in posts[:3]],
@@ -219,7 +240,7 @@ async def main(args: argparse.Namespace) -> dict[str, Any]:
             "fell_back": composed.fell_back,
             "rejected": list(composed.rejected),
             "seconds": round(composing, 1),
-            "usd": round(_cost(queen_usage, args), 6),
+            "usd": round(price.of(queen.usage), 6),
             **queen_usage,
         }
     return report
@@ -262,6 +283,13 @@ def cli() -> argparse.Namespace:
         "--price-in", type=float, default=0.03, help="USD per 1M input tokens"
     )
     p.add_argument("--price-out", type=float, default=0.13, help="USD per 1M output")
+    p.add_argument(
+        "--usd", type=float, default=0.0, help="stop once the run costs this"
+    )
+    p.add_argument("--tokens", type=int, default=0, help="stop after this many tokens")
+    p.add_argument(
+        "--requests", type=int, default=0, help="stop after this many requests"
+    )
     return p.parse_args()
 
 

@@ -22,7 +22,7 @@ uv add --group dev <pkg>     # dev tooling
 ```bash
 uv run ruff check <paths>             # lint
 uv run ruff format <paths>            # format (add --check to verify only)
-uv run ty check packages/fedotmas packages/fedotmas-meta     # types
+uv run ty check packages/                                     # types
 uv run pytest packages/fedotmas packages/fedotmas-llm packages/fedotmas-meta -q
 ```
 

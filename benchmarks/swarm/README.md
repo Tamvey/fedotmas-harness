@@ -16,6 +16,7 @@ uv sync --all-packages --extra pydantic-ai
 echo 'OPENROUTER_API_KEY=...' >> .env
 uv run python benchmarks/swarm/run.py --personas 40 --rounds 15
 uv run python benchmarks/swarm/run.py --personas 40 --rounds 15 --compose --batch 10
+uv run python benchmarks/swarm/run.py --personas 40 --rounds 15 --usd 0.001
 ```
 
 A run writes its report to `benchmarks/out/<db>.json` and leaves the feed itself in the
@@ -95,6 +96,27 @@ What the composer runs showed:
 
 Every composed run above ended with no retry and 3 requests in flight at the peak, the same as
 the handwritten baseline: composing the cast changes who is in the room, not how the room runs.
+
+## Stopping on budget
+
+`--usd`, `--tokens` and `--requests` put a `SpendLimit` in the onion under `ConcurrencyLimit`,
+so the run ends when its money runs out rather than when its rounds do. Ten personas over a
+nominal eight rounds, reasoning off, concurrency 2:
+
+| cap | requests | input | output | USD | rounds | skipped | reason |
+|---|---|---|---|---|---|---|---|
+| `--requests 8` | 9 | 1 184 | 346 | 0.000081 | 7 of 8 | 12 | stalled |
+| `--usd 0.00005` | 8 | 992 | 326 | 0.000072 | 7 of 8 | 13 | stalled |
+
+Both runs stopped themselves. Two things the numbers show:
+
+- **The cap is a floor, and the overshoot is the concurrency.** The request run asked for 8
+  and made 9: the check happens before a call, so calls already in flight still land. At
+  concurrency 2 the overshoot was 1, and it cannot exceed the cap.
+- **A spent budget is not a failure.** Nothing is called past the cap, so no new facts are
+  written, nothing re-arms and the run winds down on its own. `reason` is `stalled` only
+  because these runs name a goal tag nothing ever writes; the feed and every post made before
+  the cap are in the SQLite file exactly as they would be after a full run.
 
 ## The queen inside the loop
 
