@@ -120,3 +120,21 @@ n = 100, seed = 7, 3 runs per cell (mean±sd). Executor = model column. Selector
 | MathQA (capped) | 0.73 | 0.73 | 0.74 | +1pp |
 
 _Selector single-run except LogiQA/gpt-oss-20b (3 runs); MathQA selector not run. Figures: benchmarks/figures/{headroom,pareto,selector}.png._
+
+## Swarm cost — qwen3.8-flash (40 agents, 15 rounds)
+
+Not accuracy: what a throttled swarm of prompt rules costs on a real provider. Setup and
+commentary in `benchmarks/swarm/README.md`; run with `benchmarks/swarm/run.py`.
+
+| run | personas x rounds | requests | input | output | of which reasoning | USD | wall |
+|---|---|---|---|---|---|---|---|
+| smoke | 2 x 1 | 1 | 101 | 293 | 257 | 0.0002 | 17s |
+| small | 10 x 3 | 10 | 1 832 | 2 959 | 2 439 | 0.0017 | 40s |
+| small, no reasoning | 10 x 3 | 10 | 1 544 | 496 | 0 | 0.0005 | 22s |
+| full | 40 x 15 | 76 | 56 693 | 29 914 | 26 428 | 0.0226 | 262s |
+| full, no reasoning | 40 x 15 | 76 | 51 745 | 4 199 | 0 | 0.0097 | 92s |
+
+_`openrouter:qwen/qwen3.8-flash`, 2026-09-12, seed 7, `ActivitySample(3, 8)` +
+`ConcurrencyLimit(3)` + `Retry(3, on=ModelHTTPError)` over `SqliteStore`. Priced at the
+catalog's $0.15/M input, $0.47/M output. ActivitySample turned 600 possible persona-rounds
+into 76 requests; no 429 or 5xx occurred, so Retry never fired._
