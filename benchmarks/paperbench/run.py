@@ -391,7 +391,7 @@ class RunState:
     price_in: float = 0.03
     price_out: float = 0.13
     retries: int = 3
-    max_tokens: int = 4000
+    max_tokens: int = 32000
     usage: dict[str, Any] = field(default_factory=dict)
     budget: dict[str, Any] = field(default_factory=dict)
 
@@ -533,12 +533,24 @@ async def judge_variant(
 ) -> dict[str, Any]:
     """`PydanticAI.complete` validates its reply against `call.returns` itself, so there
     is no JSON to parse by hand here — unlike a persona's plain-string post, the judge's
-    reply is always a structured `Call.returns=JudgeReport`."""
+    reply is always a structured `Call.returns=JudgeReport`. Called directly, outside the
+    engine, so it gets none of the swarm phase's `Retry` plugin for free — retried here by
+    hand, the same `state.retries`/`ModelHTTPError` policy, so a transient 429/5xx doesn't
+    take the whole run down with it. Backed off exponentially (1s, 2s, 4s, ...) between
+    attempts, capped at 30s, rather than re-hitting an already-rate-limited provider
+    immediately."""
     call = Call(
         prompt=judge_prompt(state.leaves, variant["code"]),
         input="",
         returns=JudgeReport,
     )
+    delay = 1.0
+    for _ in range(state.retries - 1):
+        try:
+            return score(state.leaves, await backend.complete(call, NO_VIEW))
+        except ModelHTTPError:
+            await asyncio.sleep(delay)
+            delay = min(delay * 2, 30.0)
     report = await backend.complete(call, NO_VIEW)
     return score(state.leaves, report)
 
@@ -789,10 +801,12 @@ def cli() -> argparse.Namespace:
     p.add_argument(
         "--max-tokens",
         type=int,
-        default=4000,
-        help="response length cap per call; a persona writes a whole file each post, "
-        "not a one-line argument the way free-topic's does, so this defaults far above "
-        "free-topic's own --max-tokens 800",
+        default=32000,
+        help="response length cap per call, shared by every persona post and the judge's "
+        "one-verdict-per-leaf reply; a persona writes a whole file each post, not a "
+        "one-line argument the way free-topic's does, and the judge needs headroom "
+        "scaling with the rubric's leaf count, so this defaults far above free-topic's "
+        "own --max-tokens 800",
     )
     p.add_argument("--seed", type=int, default=7)
     return p.parse_args()

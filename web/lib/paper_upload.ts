@@ -44,7 +44,7 @@ export const MAX_REQUESTS = 5000;
  * "Exceeded maximum output retries" from a truncated reply. */
 export const MIN_MAX_TOKENS = 256;
 export const MAX_MAX_TOKENS = 32_000;
-export const DEFAULT_MAX_TOKENS = 4000;
+export const DEFAULT_MAX_TOKENS = 32_000;
 
 export interface PaperScalars {
   timeoutSeconds: number;

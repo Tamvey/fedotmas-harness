@@ -39,19 +39,24 @@ Open the URL it prints (`http://localhost:5173` by default) and go to
 - **Source**: click **PDF**, then upload
   `benchmarks/paperbench/data/classifier-free-guidance/paper.pdf` under
   **Paper PDF**.
-- **Rubric branch JSON (optional)**: upload
-  `benchmarks/paperbench/data/classifier-free-guidance/rubric_branch.json`.
-  This branch is filtered to the paper's Code Development leaves only — see
-  its own `README.md` in that same directory for what that does and doesn't
-  grade.
+- **Rubric and criteria**: at least one of the two below is required; give
+  both and they're graded together.
+  - **Rubric branch JSON (optional)**: upload
+    `benchmarks/paperbench/data/classifier-free-guidance/rubric_branch.json`.
+    This branch is filtered to the paper's Code Development leaves only —
+    see its own `README.md` in that same directory for what that does and
+    doesn't grade.
+  - **Custom criteria (optional)**: type your own requirements directly in
+    the form instead, one per line with its own weight.
 - **Model**: any OpenRouter id from the list (e.g. `openrouter:qwen/qwen3.7-flash`).
 - **Stop after**: pick an axis (dollars/tokens/requests) and an amount above
   zero — required for PaperBench, the run is refused with all three at zero.
 - **Max tokens**: the judge answers with one verdict per rubric leaf in a
   single reply, so the bigger the rubric, the higher this needs to be set —
   well above the field's default for the bundled example's 70 leaves, and
-  higher still for a larger `rubric_branch.json` of your own. Too low and the
-  judge step exhausts its output retries instead of finishing.
+  higher still for a larger `rubric_branch.json` of your own. Too low and
+  the judge step fails outright ("Exceeded maximum output retries"), taking
+  the whole run down with it rather than just that one score.
 
 ## 4. Run and read the result
 
